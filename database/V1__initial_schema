@@ -1,0 +1,203 @@
+-- =============================================================
+--  KRAKEN FINANCE — Schema PostgreSQL
+--  Ordem: ENUMs → Tabelas → Índices → Trigger updated_at
+-- =============================================================
+
+
+-- -------------------------------------------------------------
+--  ENUMs
+-- -------------------------------------------------------------
+
+CREATE TYPE account_type AS ENUM (
+  'CHECKING',
+  'SAVINGS',
+  'CASH',
+  'INVESTMENT',
+  'DIGITAL_WALLET'
+);
+
+CREATE TYPE category_type AS ENUM (
+  'INCOME',
+  'EXPENSE',
+  'BOTH'
+);
+
+CREATE TYPE transaction_type AS ENUM (
+  'INCOME',
+  'EXPENSE',
+  'TRANSFER'
+);
+
+CREATE TYPE installment_status AS ENUM (
+  'PENDING',
+  'PAID',
+  'OVERDUE',
+  'CANCELED'
+);
+
+
+-- -------------------------------------------------------------
+--  USUARIO
+-- -------------------------------------------------------------
+
+CREATE TABLE users (
+  id          UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
+  email       VARCHAR(255) NOT NULL UNIQUE,
+  name        VARCHAR(100) NOT NULL,
+  password_hash  VARCHAR(255) NOT NULL,
+  created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+
+-- -------------------------------------------------------------
+--  CONTA
+-- -------------------------------------------------------------
+
+CREATE TABLE accounts (
+  id            UUID         PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id    UUID         NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  name          VARCHAR(100) NOT NULL,
+  type          account_type   NOT NULL,
+  initial_balance NUMERIC(15,2) NOT NULL DEFAULT 0.00,
+  color           VARCHAR(7),         -- hex: #3B82F6
+  icon         VARCHAR(50),        -- slug: "piggy-bank"
+  active         BOOLEAN      NOT NULL DEFAULT TRUE,
+  created_at    TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+  updated_at    TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+);
+
+
+-- -------------------------------------------------------------
+--  CATEGORIA
+-- -------------------------------------------------------------
+
+CREATE TABLE categories (
+  id          UUID           PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id  UUID           REFERENCES users(id) ON DELETE CASCADE,  -- NULL = categoria de sistema
+  name        VARCHAR(100)   NOT NULL,
+  type        category_type NOT NULL,
+  color         VARCHAR(7),
+  icon       VARCHAR(50),
+  system     BOOLEAN        NOT NULL DEFAULT FALSE,
+  created_at  TIMESTAMPTZ    NOT NULL DEFAULT NOW(),
+
+  -- categoria de sistema não tem dono; categoria personalizada sempre tem
+  CONSTRAINT chk_category_system
+    CHECK ((system = TRUE) = (user_id IS NULL))
+);
+
+-- usuário não pode ter duas categorias com o mesmo nome (ignora categorias de sistema)
+CREATE UNIQUE INDEX uq_category_user_name
+  ON categories (user_id, name)
+  WHERE system = FALSE;
+
+
+-- -------------------------------------------------------------
+--  TRANSACAO
+-- -------------------------------------------------------------
+
+CREATE TABLE transactions (
+  id                UUID           PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id        UUID           NOT NULL REFERENCES users(id)   ON DELETE CASCADE,
+  account_id          UUID           NOT NULL REFERENCES accounts(id)     ON DELETE RESTRICT,
+  destination_account_id  UUID                    REFERENCES accounts(id)     ON DELETE RESTRICT,  -- só em TRANSFERENCIA
+  category_id      UUID           NOT NULL REFERENCES categories(id) ON DELETE RESTRICT,
+  type              transaction_type NOT NULL,
+  total_value       NUMERIC(15,2)  NOT NULL,
+  description         VARCHAR(255)   NOT NULL,
+  observation        TEXT,
+  transaction_date              DATE           NOT NULL,
+  is_installment         BOOLEAN        NOT NULL DEFAULT FALSE,
+  total_installment    SMALLINT,               -- obrigatório quando parcelado = TRUE
+  created_at        TIMESTAMPTZ    NOT NULL DEFAULT NOW(),
+
+  CONSTRAINT chk_transaction_value_positive
+    CHECK (total_value > 0),
+
+  -- TRANSFERENCIA exige conta_destino_id; outros tipos não devem tê-la
+  CONSTRAINT chk_installment_transfer
+    CHECK ((type = 'TRANSFER') = (destination_account_id IS NOT NULL)),
+
+  -- não pode transferir para a mesma conta
+  CONSTRAINT chk_transaction_different_accounts
+    CHECK (account_id <> destination_account_id),
+
+  -- parcelado=true exige total_parcelas; parcelado=false não pode tê-lo
+  CONSTRAINT chk_transaction_installment
+    CHECK (is_installment = (total_installment IS NOT NULL)),
+
+  -- parcelamento mínimo de 2x
+  CONSTRAINT chk_transaction_min_installment
+    CHECK (total_installment IS NULL OR total_installment > 1)
+);
+
+
+-- -------------------------------------------------------------
+--  PARCELA
+-- -------------------------------------------------------------
+
+CREATE TABLE installments (
+  id              UUID           PRIMARY KEY DEFAULT gen_random_uuid(),
+  transaction_id    UUID           NOT NULL REFERENCES transactions(id) ON DELETE CASCADE,
+  installment_number  SMALLINT       NOT NULL,
+  value           NUMERIC(15,2)  NOT NULL,
+  due_date DATE           NOT NULL,
+  payment_date  DATE,                    -- NULL = ainda não paga
+  status          installment_status NOT NULL DEFAULT 'PENDING',
+  created_at      TIMESTAMPTZ    NOT NULL DEFAULT NOW(),
+
+  CONSTRAINT chk_installment_positive_number
+    CHECK (installment_number >= 1),
+
+  CONSTRAINT chk_installment_positive_value
+    CHECK (value > 0),
+
+  -- não pode haver duas parcelas com o mesmo número na mesma transação
+  CONSTRAINT uq_number_installment
+    UNIQUE (transaction_id, installment_number)
+);
+
+
+-- -------------------------------------------------------------
+--  ÍNDICES
+-- -------------------------------------------------------------
+
+-- conta
+CREATE INDEX idx_account_user_id   ON accounts (user_id);
+
+-- categoria
+CREATE INDEX idx_category_user_id ON categories (user_id);
+
+-- transacao
+CREATE INDEX idx_transaction_user_id  ON transactions (user_id);
+CREATE INDEX idx_transaction_account_id     ON transactions (account_id);
+CREATE INDEX idx_transaction_category_id ON transactions (category_id);
+CREATE INDEX idx_transaction_data         ON transactions (transaction_date);
+CREATE INDEX idx_transaction_usuario_data ON transactions (user_id, transaction_date);  -- dashboard e relatórios mensais
+
+-- parcela
+CREATE INDEX idx_installment_transaction_id    ON installments (transaction_id);
+CREATE INDEX idx_installment_due_date ON installments (due_date);
+CREATE INDEX idx_installment_status          ON installments (status);
+
+
+-- -------------------------------------------------------------
+--  TRIGGER — updated_at automático
+-- -------------------------------------------------------------
+
+CREATE OR REPLACE FUNCTION fn_set_updated_at()
+RETURNS TRIGGER AS $$
+BEGIN
+  NEW.updated_at = NOW();
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trg_user_updated_at
+  BEFORE UPDATE ON users
+  FOR EACH ROW EXECUTE FUNCTION fn_set_updated_at();
+
+CREATE TRIGGER trg_account_updated_at
+  BEFORE UPDATE ON accounts
+  FOR EACH ROW EXECUTE FUNCTION fn_set_updated_at();
